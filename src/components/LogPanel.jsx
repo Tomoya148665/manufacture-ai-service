@@ -1,9 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import './LogPanel.css';
+import { generateLogReport } from '../api/openai';
 
 function LogPanel({ logManager, isVisible, onClose }) {
   const [logSummary, setLogSummary] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
+  const [report, setReport] = useState(null);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
   useEffect(() => {
     if (isVisible && logManager) {
@@ -49,6 +52,12 @@ function LogPanel({ logManager, isVisible, onClose }) {
             onClick={() => setActiveTab('chat')}
           >
             チャットログ
+          </button>
+          <button
+            className={`tab ${activeTab === 'report' ? 'active' : ''}`}
+            onClick={() => setActiveTab('report')}
+          >
+            レポート
           </button>
         </div>
 
@@ -116,6 +125,88 @@ function LogPanel({ logManager, isVisible, onClose }) {
                   <p className="no-logs">チャットメッセージはありません</p>
                 )}
               </div>
+            </div>
+          )}
+
+          {activeTab === 'report' && (
+            <div className="log-report">
+              <h3>AIログ分析レポート</h3>
+              {!report && !isGeneratingReport && (
+                <div className="report-container">
+                  <p className="report-description">
+                    GPT-4o-miniを使用して、現在のセッションのログを分析し、
+                    センサー状態の傾向やチャット内容の概要レポートを生成します。
+                  </p>
+                  <button
+                    className="generate-report-button"
+                    onClick={async () => {
+                      setIsGeneratingReport(true);
+                      try {
+                        const allLogs = [
+                          ...logManager.current.logs.sensorChanges.map(log => ({
+                            type: 'sensor',
+                            timestamp: log.timestamp,
+                            sensorKey: log.sensorKey,
+                            previousState: log.previousState,
+                            newState: log.newState
+                          })),
+                          ...logManager.current.logs.chatMessages.map(log => ({
+                            type: 'chat',
+                            timestamp: log.timestamp,
+                            role: log.role,
+                            message: log.text,
+                            sensorState: log.sensorState
+                          }))
+                        ];
+                        const reportText = await generateLogReport(allLogs);
+                        setReport(reportText);
+                      } catch (error) {
+                        console.error('レポート生成エラー:', error);
+                        setReport('レポート生成中にエラーが発生しました。');
+                      } finally {
+                        setIsGeneratingReport(false);
+                      }
+                    }}
+                  >
+                    レポートを生成
+                  </button>
+                </div>
+              )}
+              {isGeneratingReport && (
+                <div className="report-loading">
+                  <p>レポートを生成中...</p>
+                  <div className="spinner"></div>
+                </div>
+              )}
+              {report && (
+                <div className="report-content">
+                  <pre>{report}</pre>
+                  <div className="report-actions">
+                    <button
+                      className="download-button"
+                      onClick={() => {
+                        const blob = new Blob([report], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `log_report_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }}
+                    >
+                      レポートをダウンロード
+                    </button>
+                    <button
+                      className="regenerate-button"
+                      onClick={() => setReport(null)}
+                    >
+                      再生成
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

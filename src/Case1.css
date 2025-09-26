@@ -273,3 +273,44 @@
     min-width: calc(50% - 5px);
   }
 }
+/* 音声入力関連のスタイル */
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(255, 68, 68, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 68, 68, 0);
+  }
+}
+
+.voice-input-container {
+  background: #f8f9fa;
+  border-radius: 8px;
+}
+
+.mic-button {
+  transition: all 0.3s ease;
+}
+
+.mic-button:hover {
+  transform: scale(1.05);
+}
+
+.mic-button.listening {
+  animation: pulse 1.5s infinite;
+}
+
+.voice-toggle-button {
+  transition: all 0.3s ease;
+}
+
+.voice-toggle-button:hover:not(:disabled) {
+  transform: scale(1.1);
+}
+
+.voice-toggle-button:disabled {
+  cursor: not-allowed;
+}
