@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './Case1.css';
+import { generateAIResponse, loadSensorStates, getSensorContext } from './api/openai';
+import LogManager from './utils/logManager';
+import LogPanel from './components/LogPanel';
 
 const SENSOR_STATUS = {
   NORMAL: '正常',
@@ -66,12 +69,22 @@ function SensorPanel({ sensors, onSensorChange }) {
   );
 }
 
-function ChatPanel({ sensors }) {
+function ChatPanel({ sensors, logManager }) {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [showBanner, setShowBanner] = useState(false);
+  const [sensorStates, setSensorStates] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
   const chatViewRef = useRef(null);
   const prevS2Ref = useRef(sensors.s2);
+
+  useEffect(() => {
+    const loadCSV = async () => {
+      const states = await loadSensorStates('/sensor_states.csv');
+      setSensorStates(states);
+    };
+    loadCSV();
+  }, []);
 
   useEffect(() => {
     if (prevS2Ref.current !== SENSOR_STATUS.ABNORMAL &&
@@ -95,39 +108,21 @@ function ChatPanel({ sensors }) {
   }, [messages]);
 
   const processUserMessage = async (userInput) => {
-    const normalizedInput = userInput.replace('　', ' ').toLowerCase();
+    const sensorContext = getSensorContext(sensors, sensorStates);
 
-    if (sensors.s2 === SENSOR_STATUS.ABNORMAL) {
-      if (normalizedInput.includes('何が発生') ||
-          normalizedInput.includes('何が起き')) {
-        return 'パレタイジングエラーにより自動停止しました。';
-      }
+    // 会話履歴を準備（role, contentの形式に変換）
+    const conversationHistory = messages.map(msg => ({
+      role: msg.role,
+      content: msg.text
+    }));
 
-      if (normalizedInput.includes('どうしたら') ||
-          normalizedInput.includes('どうすれば') ||
-          normalizedInput.includes('対処')) {
-        return 'センサー2の信号が確認できません。センサー2の状態を確認してください。';
-      }
-    }
-
-    if (sensors.s2 === SENSOR_STATUS.ABNORMAL && sensors.s1 === SENSOR_STATUS.ABNORMAL) {
-      return 'センサー1とセンサー2が異常です。原因切り分けのため、配線・位置ズレ・汚れをご確認ください。';
-    }
-
-    if (sensors.s2 === SENSOR_STATUS.ABNORMAL) {
-      return 'センサー2が異常です。原因切り分けのため、配線・位置ズレ・汚れをご確認ください。';
-    }
-
-    if (sensors.s1 === SENSOR_STATUS.ABNORMAL) {
-      return 'センサー1が異常です。原因切り分けのため、配線・位置ズレ・汚れをご確認ください。';
-    }
-
-    return '現在、全センサーは正常です。';
+    const aiResponse = await generateAIResponse(userInput, sensorContext, conversationHistory);
+    return aiResponse;
   };
 
   const handleSend = async () => {
     const msg = inputText.trim();
-    if (!msg) return;
+    if (!msg || isLoading) return;
 
     const userMessage = {
       role: 'user',
@@ -138,10 +133,14 @@ function ChatPanel({ sensors }) {
 
     setMessages(prev => [...prev, userMessage]);
     setInputText('');
+    setIsLoading(true);
 
-    const reply = await processUserMessage(msg);
+    // チャットメッセージをログに記録
+    logManager.current.logChatMessage('user', msg, sensors);
 
-    setTimeout(() => {
+    try {
+      const reply = await processUserMessage(msg);
+
       const assistantMessage = {
         role: 'assistant',
         text: reply,
@@ -149,7 +148,21 @@ function ChatPanel({ sensors }) {
         sensorState: { ...sensors }
       };
       setMessages(prev => [...prev, assistantMessage]);
-    }, 300);
+
+      // AIレスポンスをログに記録
+      logManager.current.logChatMessage('assistant', reply, sensors);
+    } catch (error) {
+      console.error('Error generating response:', error);
+      const errorMessage = {
+        role: 'assistant',
+        text: 'エラーが発生しました。もう一度お試しください。',
+        timestamp: new Date().toISOString(),
+        sensorState: { ...sensors }
+      };
+      setMessages(prev => [...prev, errorMessage]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleKeyDown = (e) => {
@@ -190,7 +203,7 @@ function ChatPanel({ sensors }) {
           {messages.map((msg, idx) => (
             <div key={idx} className="chat-message">
               <span className="message-prefix">{getMessagePrefix(msg.role)}</span>
-              <span>{msg.text}</span>
+              <span style={{ whiteSpace: 'pre-wrap' }}>{msg.text}</span>
             </div>
           ))}
         </div>
@@ -203,12 +216,17 @@ function ChatPanel({ sensors }) {
             onKeyDown={handleKeyDown}
             placeholder="メッセージを入力（Ctrl+Enterで送信）"
             rows="2"
+            disabled={isLoading}
           />
-          <button className="send-button" onClick={handleSend}>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="22" y1="2" x2="11" y2="13"></line>
-              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-            </svg>
+          <button className="send-button" onClick={handleSend} disabled={isLoading}>
+            {isLoading ? (
+              <span>...</span>
+            ) : (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            )}
           </button>
         </div>
       </div>
@@ -221,18 +239,54 @@ function Case1() {
     s1: SENSOR_STATUS.NORMAL,
     s2: SENSOR_STATUS.NORMAL
   });
+  const [showLogPanel, setShowLogPanel] = useState(false);
+  const logManagerRef = useRef(new LogManager());
 
   const handleSensorChange = (sensorKey, status) => {
-    setSensors(prev => ({
-      ...prev,
-      [sensorKey]: status
-    }));
+    // 現在の状態を取得
+    const currentStatus = sensors[sensorKey];
+
+    // 状態が変更された場合のみ更新とログ記録
+    if (currentStatus !== status) {
+      // ログに記録（setSensorsの外で実行）
+      logManagerRef.current.logSensorChange(
+        sensorKey,
+        currentStatus,
+        status
+      );
+
+      // 状態を更新
+      setSensors(prev => ({
+        ...prev,
+        [sensorKey]: status
+      }));
+    }
   };
 
   return (
     <div className="case1-app">
       <div className="case1-header">
         <h1 className="case1-title">センサー/PLC × AIチャット</h1>
+        <button
+          className="log-button"
+          onClick={() => setShowLogPanel(true)}
+          style={{
+            position: 'absolute',
+            right: '20px',
+            top: '50%',
+            transform: 'translateY(-50%)',
+            padding: '8px 20px',
+            backgroundColor: '#4a9eff',
+            color: 'white',
+            border: 'none',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            fontSize: '14px',
+            fontWeight: '500'
+          }}
+        >
+          ログ管理
+        </button>
       </div>
 
       <div className="case1-container">
@@ -241,8 +295,14 @@ function Case1() {
           onSensorChange={handleSensorChange}
         />
         <div className="divider"></div>
-        <ChatPanel sensors={sensors} />
+        <ChatPanel sensors={sensors} logManager={logManagerRef} />
       </div>
+
+      <LogPanel
+        logManager={logManagerRef}
+        isVisible={showLogPanel}
+        onClose={() => setShowLogPanel(false)}
+      />
     </div>
   );
 }
