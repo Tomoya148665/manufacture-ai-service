@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
 import './Case1.css';
 import { generateAIResponse, loadSensorStates, getSensorContext } from './api/openai';
 import LogManager from './utils/logManager';
 import LogPanel from './components/LogPanel';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { useSpeechSynthesis } from './hooks/useSpeechSynthesis';
+import { transcribeBlob, synthesizeSpeech, playAudioBlob } from './utils/audioClient';
 
 const SENSOR_STATUS = {
   NORMAL: '正常',
@@ -15,8 +17,14 @@ function Lamp({ status }) {
   const isNormal = status === SENSOR_STATUS.NORMAL;
   return (
     <div
-      className="lamp"
-      style={{ backgroundColor: isNormal ? '#C9CDD2' : '#E64A4A' }}
+      className={`lamp ${isNormal ? 'normal' : 'abnormal'}`}
+      style={{
+        backgroundColor: isNormal ? '#4CAF50' : '#E64A4A',
+        boxShadow: isNormal
+          ? '0 0 20px rgba(76, 175, 80, 0.8), inset 0 0 10px rgba(255, 255, 255, 0.3)'
+          : '0 0 20px rgba(230, 74, 74, 0.8), inset 0 0 10px rgba(255, 255, 255, 0.3)',
+        animation: isNormal ? 'pulseGreen 2s infinite' : 'pulseRed 2s infinite'
+      }}
     />
   );
 }
@@ -79,6 +87,9 @@ function ChatPanel({ sensors, logManager }) {
   const [isLoading, setIsLoading] = useState(false);
   const [voiceMode, setVoiceMode] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
   const chatViewRef = useRef(null);
   const prevS2Ref = useRef(sensors.s2);
 
@@ -86,6 +97,9 @@ function ChatPanel({ sensors, logManager }) {
   const {
     isListening,
     transcript,
+    finalTranscript,
+    interimTranscript,
+    isSilent,
     error: speechError,
     startListening,
     stopListening,
@@ -109,19 +123,15 @@ function ChatPanel({ sensors, logManager }) {
   }, []);
 
   useEffect(() => {
-    if (prevS2Ref.current !== SENSOR_STATUS.ABNORMAL &&
-        sensors.s2 === SENSOR_STATUS.ABNORMAL) {
+    // どちらか片方でも異常になったらアラートを表示
+    if (sensors.s1 === SENSOR_STATUS.ABNORMAL || sensors.s2 === SENSOR_STATUS.ABNORMAL) {
       setShowBanner(true);
-    }
-
-    if (sensors.s2 === SENSOR_STATUS.NORMAL) {
+    } else {
       setShowBanner(false);
-    } else if (sensors.s2 === SENSOR_STATUS.ABNORMAL) {
-      setShowBanner(true);
     }
 
     prevS2Ref.current = sensors.s2;
-  }, [sensors.s2]);
+  }, [sensors.s1, sensors.s2]);
 
   useEffect(() => {
     if (chatViewRef.current) {
@@ -146,7 +156,15 @@ function ChatPanel({ sensors, logManager }) {
 
   const handleSend = async () => {
     const msg = inputText.trim();
-    if (!msg || isLoading) return;
+    console.log('📤 handleSend呼び出し');
+    console.log('📝 送信メッセージ:', msg);
+    console.log('🔄 isLoading:', isLoading);
+    console.log('🎤 voiceMode:', voiceMode);
+
+    if (!msg || isLoading) {
+      console.log('⚠️ 送信キャンセル: メッセージ空またはLoading中');
+      return;
+    }
 
     const userMessage = {
       role: 'user',
@@ -164,7 +182,9 @@ function ChatPanel({ sensors, logManager }) {
 
     try {
       // 最新のセンサー状態を明示的に渡す
+      console.log('🤖 AIレスポンスを取得中...');
       const reply = await processUserMessage(msg, sensors);
+      console.log('✅ AIレスポンス取得完了:', reply);
 
       const assistantMessage = {
         role: 'assistant',
@@ -177,9 +197,27 @@ function ChatPanel({ sensors, logManager }) {
       // AIレスポンスをログに記録
       logManager.current.logChatMessage('assistant', reply, sensors);
 
-      // 音声モードの場合は読み上げ
-      if (voiceMode && isSpeechSynthesisSupported) {
-        speak(reply);
+      if (voiceMode) {
+        console.log('🔊 音声モード: AIレスポンスを読み上げます');
+        try {
+          // OpenAI TTSを優先的に使用
+          console.log('🌐 OpenAI TTSを使用します');
+          const audioBlob = await synthesizeSpeech(reply);
+          playAudioBlob(audioBlob);
+          console.log('✅ OpenAI音声再生開始');
+        } catch (e) {
+          console.error('❌ OpenAI TTS エラー:', e);
+          // OpenAI TTSが失敗した場合、ブラウザAPIにフォールバック
+          console.log('🔄 ブラウザAPIにフォールバックします');
+          if (isSpeechSynthesisSupported) {
+            speak(reply);
+            console.log('✅ 音声合成開始 (ブラウザAPI)');
+          } else {
+            console.error('❌ 音声合成が利用できません');
+          }
+        }
+      } else {
+        console.log('🔇 テキストモード: 音声合成をスキップ');
       }
     } catch (error) {
       console.error('Error generating response:', error);
@@ -204,59 +242,141 @@ function ChatPanel({ sensors, logManager }) {
 
   // 音声入力の処理
   useEffect(() => {
+    console.log('🎯 transcript変更検出:', transcript);
+    console.log('🎯 voiceMode:', voiceMode);
+    console.log('🎯 isListening:', isListening);
+
     if (transcript && voiceMode) {
       // 音声認識のテキストを表示
+      console.log('📝 音声認識テキストを入力欄に設定:', transcript);
       setInputText(transcript);
     }
   }, [transcript, voiceMode]);
 
+  // 沈黙検出による自動送信
+  useEffect(() => {
+    if (isSilent && finalTranscript && voiceMode && !isLoading && isListening) {
+      console.log('🔇 沈黙を検出、自動送信を実行');
+      console.log('📝 送信テキスト:', finalTranscript);
+
+      // 自動送信を実行
+      const sendMessage = async () => {
+        const msg = finalTranscript.trim();
+        if (msg) {
+          // 入力欄にテキストを設定
+          setInputText(msg);
+
+          // メッセージを送信
+          await handleSend();
+
+          // トランスクリプトをクリア
+          clearTranscript();
+          setInputText('');
+
+          // 音声認識を継続（会話を継続）
+          console.log('🔄 音声認識を継続');
+        }
+      };
+
+      sendMessage();
+    }
+  }, [isSilent, finalTranscript, voiceMode, isLoading, isListening]);
+
   // 音声モードの切り替え
   const toggleVoiceMode = () => {
+    console.log('🔄 音声モード切替');
+    console.log('現在のvoiceMode:', voiceMode);
+    console.log('isSpeechRecognitionSupported:', isSpeechRecognitionSupported);
+    console.log('isSpeechSynthesisSupported:', isSpeechSynthesisSupported);
+
     if (voiceMode) {
       // 音声モードをOFF
+      console.log('📴 音声モードをOFFにします');
       stopListening();
       stopSpeaking();
       setVoiceMode(false);
     } else {
       // 音声モードをON
+      console.log('📱 音声モードをONにします');
       setVoiceMode(true);
     }
   };
 
-  // マイクボタンの処理
-  const handleMicButton = () => {
-    if (isListening) {
-      // 録音停止
-      stopListening();
+  // マイクボタンの処理（Web Speech API 優先、非対応時はMediaRecorderでサーバSTT）
+  const handleMicButton = async () => {
+    console.log('🔘 マイクボタンクリック');
+    console.log('isSpeechRecognitionSupported:', isSpeechRecognitionSupported);
+    console.log('isListening:', isListening);
+    console.log('voiceMode:', voiceMode);
 
-      // テキストがある場合のみ送信（重複送信を防ぐ）
-      if (inputText && inputText.trim() && !isSending) {
-        setIsSending(true);
-
-        // 少し遅延を入れて送信（音声認識の最終処理を待つ）
-        setTimeout(() => {
-          handleSend();
+    if (isSpeechRecognitionSupported) {
+      if (isListening) {
+        console.log('⏹️ 会話を終了します');
+        stopListening();
+        // 最終的なテキストがあれば送信
+        if (finalTranscript && finalTranscript.trim()) {
+          setInputText(finalTranscript);
+          await handleSend();
           clearTranscript();
           setInputText('');
-
-          // 送信完了後にフラグをリセット
-          setTimeout(() => {
-            setIsSending(false);
-          }, 1000);
-        }, 100);
+        }
       } else {
-        // テキストがない場合はクリアのみ
+        console.log('🎤 会話を開始します');
         clearTranscript();
         setInputText('');
+        setIsSending(false);
+        stopSpeaking();
+        await startListening();
       }
-    } else {
-      // 録音開始前にクリア
+      return;
+    }
+
+    if (!isRecording) {
       clearTranscript();
       setInputText('');
       setIsSending(false);
-      // AIの音声を停止
       stopSpeaking();
-      startListening();
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+        const mr = new MediaRecorder(stream, { mimeType });
+        recordedChunksRef.current = [];
+        mr.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
+        };
+        mr.onstop = async () => {
+          try {
+            const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+            const text = await transcribeBlob(blob, 'audio/webm');
+            if (text && !isSending) {
+              setInputText(text);
+              setIsSending(true);
+              setTimeout(async () => {
+                await handleSend();
+                setInputText('');
+                setTimeout(() => setIsSending(false), 1000);
+              }, 50);
+            }
+          } catch (err) {
+            console.error('Transcription error:', err);
+          } finally {
+            stream.getTracks().forEach(t => t.stop());
+            mediaRecorderRef.current = null;
+          }
+        };
+        mediaRecorderRef.current = mr;
+        mr.start();
+        setIsRecording(true);
+      } catch (err) {
+        console.error('Mic access error:', err);
+      }
+    } else {
+      const mr = mediaRecorderRef.current;
+      if (mr && mr.state !== 'inactive') {
+        mr.stop();
+      }
+      setIsRecording(false);
     }
   };
 
@@ -273,48 +393,111 @@ function ChatPanel({ sensors, logManager }) {
     <div className="panel right-panel">
       <h2 className="panel-title">AIシステム側</h2>
 
-      <div className="ai-status">
-        <div>センサー1　{sensors.s1}</div>
-        <div>センサー2　{sensors.s2}</div>
+      {/* AI状態カード */}
+      <div className="ai-status-card">
+        <div className="ai-status-header">
+          <div className="ai-status-indicator">
+            <div className="ai-status-dot"></div>
+            <span>AI稼働中</span>
+          </div>
+        </div>
+
+        <div className="sensor-status-row">
+          <div className={`sensor-card ${sensors.s1 === '正常' ? 'normal' : 'abnormal'}`}>
+            <div className="sensor-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+              </svg>
+            </div>
+            <div className="sensor-info">
+              <span className="sensor-name">センサー1</span>
+              <span className="sensor-value">{sensors.s1}</span>
+            </div>
+          </div>
+
+          <div className={`sensor-card ${sensors.s2 === '正常' ? 'normal' : 'abnormal'}`}>
+            <div className="sensor-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+              </svg>
+            </div>
+            <div className="sensor-info">
+              <span className="sensor-name">センサー2</span>
+              <span className="sensor-value">{sensors.s2}</span>
+            </div>
+          </div>
+        </div>
+
       </div>
 
       {showBanner && (
-        <div className="alert-banner">
-          パレタイジング異常です
+        <div className="alert-banner-enhanced">
+          <div className="alert-icon-pulse">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+            </svg>
+          </div>
+          <div className="alert-content">
+            <div className="alert-title">異常検知</div>
+            <div className="alert-message">パレタイジング異常が発生しています</div>
+          </div>
+          <div className="alert-timestamp">{new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</div>
         </div>
       )}
 
       <p className="subtle-label">AIチャット画面</p>
 
       <div className="chat-frame">
+        {/* 音声機能のサポート状況やエラー表示 */}
+        {(!isSpeechRecognitionSupported || !isSpeechSynthesisSupported) && (
+          <div style={{ color: '#b94a48', background: '#f2dede', border: '1px solid #ebccd1', borderRadius: '4px', padding: '8px 10px', marginBottom: '8px', fontSize: '13px' }}>
+            音声機能が利用できません。Chrome/Edge の最新バージョンで、HTTPS もしくは localhost からアクセスし、マイク権限を許可してください。
+          </div>
+        )}
+        {speechError && (
+          <div style={{ color: '#b94a48', background: '#f2dede', border: '1px solid #ebccd1', borderRadius: '4px', padding: '8px 10px', marginBottom: '8px', fontSize: '13px' }}>
+            {speechError}
+          </div>
+        )}
         <div className="chat-view" ref={chatViewRef}>
           {messages.map((msg, idx) => (
-            <div key={idx} className="chat-message">
-              <span className="message-prefix">{getMessagePrefix(msg.role)}</span>
-              <span style={{ whiteSpace: 'pre-wrap' }}>{msg.text}</span>
+            <div key={idx} className={`message-wrapper ${msg.role}`}>
+              <div className={`message-bubble ${msg.role}`}>
+                <div className="message-header">
+                  <span className="message-role">
+                    {msg.role === 'user' ? '👤 あなた' : '🤖 AI'}
+                  </span>
+                  <span className="message-time">
+                    {new Date(msg.timestamp).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                </div>
+                <div className="message-content">
+                  <ReactMarkdown>{msg.text}</ReactMarkdown>
+                </div>
+              </div>
             </div>
           ))}
         </div>
 
         <div className="chat-input-row">
-          {voiceMode && isSpeechRecognitionSupported ? (
+          {voiceMode ? (
             <div className="voice-input-container" style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '10px', padding: '10px' }}>
               <button
-                className={`mic-button ${isListening ? 'listening' : ''}`}
+                className={`mic-button ${isListening || isRecording ? 'listening' : ''}`}
                 onClick={handleMicButton}
                 disabled={isSending || isLoading}
                 style={{
                   width: '50px',
                   height: '50px',
                   borderRadius: '50%',
-                  backgroundColor: isSending ? '#999' : (isListening ? '#ff4444' : '#4a9eff'),
+                  backgroundColor: isSending ? '#999' : ((isListening || isRecording) ? '#ff4444' : '#4a9eff'),
                   border: 'none',
                   color: 'white',
                   cursor: isSending ? 'not-allowed' : 'pointer',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  animation: isListening ? 'pulse 1.5s infinite' : 'none',
+                  animation: (isListening || isRecording) ? 'pulse 1.5s infinite' : 'none',
                   opacity: isSending ? 0.6 : 1
                 }}
               >
@@ -326,17 +509,17 @@ function ChatPanel({ sensors, logManager }) {
                 </svg>
               </button>
               <div style={{ flex: 1 }}>
-                {isListening ? (
+                {(isListening || isRecording) ? (
                   <div>
                     <div style={{ color: '#ff4444', fontWeight: 'bold' }}>🔴 録音中...</div>
-                    {transcript && (
+                    {isListening && transcript && (
                       <div style={{ marginTop: '5px', color: '#333' }}>{transcript}</div>
                     )}
                     <div style={{ fontSize: '12px', color: '#999', marginTop: '5px' }}>
                       話し終わったら、もう一度マイクボタンをタップしてください
                     </div>
                   </div>
-                ) : transcript ? (
+                ) : (isListening && transcript) ? (
                   <div>
                     <div style={{ color: '#333' }}>{transcript}</div>
                     <div style={{ fontSize: '12px', color: '#4a9eff', marginTop: '5px' }}>

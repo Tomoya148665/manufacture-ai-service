@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
 import './LogPanel.css';
 import { generateLogReport } from '../api/openai';
 
@@ -108,17 +109,19 @@ function LogPanel({ logManager, isVisible, onClose }) {
           {activeTab === 'chat' && (
             <div className="log-list">
               <h3>チャットログ</h3>
-              <div className="log-entries">
+              <div className="chat-log-entries">
                 {logManager.current.logs.chatMessages.map((log, index) => (
-                  <div key={index} className={`log-entry chat-${log.role}`}>
+                  <div key={index} className={`chat-bubble ${log.role}`}>
                     <div className="chat-header">
+                      <span className="role-icon">{log.role === 'user' ? '👤' : '🤖'}</span>
                       <span className="timestamp">{formatTime(log.timestamp)}</span>
-                      <span className="role">{log.role === 'user' ? 'ユーザー' : 'AI'}</span>
                       <span className="sensor-state">
                         S1: {log.sensorState.s1} / S2: {log.sensorState.s2}
                       </span>
                     </div>
-                    <div className="chat-text">{log.text}</div>
+                    <div className="chat-content">
+                      <ReactMarkdown>{log.text}</ReactMarkdown>
+                    </div>
                   </div>
                 ))}
                 {logManager.current.logs.chatMessages.length === 0 && (
@@ -134,7 +137,7 @@ function LogPanel({ logManager, isVisible, onClose }) {
               {!report && !isGeneratingReport && (
                 <div className="report-container">
                   <p className="report-description">
-                    GPT-4o-miniを使用して、現在のセッションのログを分析し、
+                    AIを使用して、現在のセッションのログを分析し、
                     センサー状態の傾向やチャット内容の概要レポートを生成します。
                   </p>
                   <button
@@ -147,64 +150,50 @@ function LogPanel({ logManager, isVisible, onClose }) {
                             type: 'sensor',
                             timestamp: log.timestamp,
                             sensorKey: log.sensorKey,
-                            previousState: log.previousState,
-                            newState: log.newState
+                            message: log.message,
+                            value: log.value
                           })),
                           ...logManager.current.logs.chatMessages.map(log => ({
                             type: 'chat',
                             timestamp: log.timestamp,
                             role: log.role,
-                            message: log.text,
+                            text: log.text,
                             sensorState: log.sensorState
                           }))
-                        ];
+                        ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
                         const reportText = await generateLogReport(allLogs);
                         setReport(reportText);
                       } catch (error) {
                         console.error('レポート生成エラー:', error);
-                        setReport('レポート生成中にエラーが発生しました。');
+                        setReport('レポートの生成に失敗しました。');
                       } finally {
                         setIsGeneratingReport(false);
                       }
                     }}
                   >
-                    レポートを生成
+                    レポート生成
                   </button>
                 </div>
               )}
+
               {isGeneratingReport && (
-                <div className="report-loading">
+                <div className="loading">
                   <p>レポートを生成中...</p>
-                  <div className="spinner"></div>
                 </div>
               )}
+
               {report && (
                 <div className="report-content">
-                  <pre>{report}</pre>
-                  <div className="report-actions">
-                    <button
-                      className="download-button"
-                      onClick={() => {
-                        const blob = new Blob([report], { type: 'text/plain;charset=utf-8' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = `log_report_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        URL.revokeObjectURL(url);
-                      }}
-                    >
-                      レポートをダウンロード
-                    </button>
-                    <button
-                      className="regenerate-button"
-                      onClick={() => setReport(null)}
-                    >
-                      再生成
-                    </button>
+                  <div className="markdown-content">
+                    <ReactMarkdown>{report}</ReactMarkdown>
                   </div>
+                  <button
+                    className="regenerate-button"
+                    onClick={() => setReport(null)}
+                  >
+                    再生成
+                  </button>
                 </div>
               )}
             </div>
@@ -212,23 +201,14 @@ function LogPanel({ logManager, isVisible, onClose }) {
         </div>
 
         <div className="log-panel-footer">
-          <button
-            className="download-button"
-            onClick={() => handleDownload('json')}
-          >
-            全ログをダウンロード (JSON)
+          <button onClick={() => handleDownload('csv')}>
+            CSVダウンロード
           </button>
-          <button
-            className="download-button"
-            onClick={() => handleDownload('csv-sensor')}
-          >
-            センサーログをダウンロード (CSV)
+          <button onClick={() => handleDownload('json')}>
+            JSONダウンロード
           </button>
-          <button
-            className="download-button"
-            onClick={() => handleDownload('csv-chat')}
-          >
-            チャットログをダウンロード (CSV)
+          <button onClick={() => logManager.current.clearLogs()}>
+            ログクリア
           </button>
         </div>
       </div>

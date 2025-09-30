@@ -133,7 +133,7 @@ export async function generateLogReport(logs) {
   const conversations = chatLogs.map(log => ({
     timestamp: new Date(log.timestamp).toLocaleString('ja-JP'),
     role: log.role,
-    message: log.message.substring(0, 100) + (log.message.length > 100 ? '...' : ''),
+    message: (log.text || log.message || '').substring(0, 100) + ((log.text || log.message || '').length > 100 ? '...' : ''),
     sensorState: log.sensorState
   }));
 
